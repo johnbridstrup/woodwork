@@ -5,7 +5,11 @@ import pandas as pd
 import pytest
 
 import woodwork as ww
-from woodwork.exceptions import TypeConversionError, TypingInfoMismatchWarning
+from woodwork.exceptions import (
+    ParametersIgnoredWarning,
+    TypeConversionError,
+    TypingInfoMismatchWarning
+)
 from woodwork.logical_types import (
     URL,
     Boolean,
@@ -106,6 +110,15 @@ def test_accessor_init(sample_df):
     assert isinstance(sample_df.ww.schema, Schema)
 
 
+def test_accessor_schema_property(sample_df):
+    xfail_dask_and_koalas(sample_df)
+
+    sample_df.ww.init()
+
+    assert sample_df.ww._schema is not sample_df.ww.schema
+    assert sample_df.ww._schema == sample_df.ww.schema
+
+
 def test_accessor_separation_of_params(sample_df):
     xfail_dask_and_koalas(sample_df)
     # mix up order of acccessor and schema params
@@ -123,19 +136,21 @@ def test_init_accessor_with_schema(sample_df):
 
     schema_df = sample_df.copy()
     schema_df.ww.init(name='test_schema', semantic_tags={'id': 'test_tag'}, index='id')
-    schema = schema_df.ww.schema
+    schema = schema_df.ww._schema
 
     head_df = schema_df.head(2)
     assert head_df.ww.schema is None
     head_df.ww.init(schema=schema)
 
+    assert head_df.ww._schema is schema
     assert head_df.ww.name == 'test_schema'
     assert head_df.ww.semantic_tags['id'] == {'index', 'test_tag'}
 
     iloc_df = schema_df.iloc[2:]
     assert iloc_df.ww.schema is None
-    iloc_df.ww.init(schema=schema, logical_types={'id': NaturalLanguage})
+    iloc_df.ww.init(schema=schema)
 
+    assert iloc_df.ww._schema is schema
     assert iloc_df.ww.name == 'test_schema'
     assert iloc_df.ww.semantic_tags['id'] == {'index', 'test_tag'}
     # Extra parameters do not take effect
@@ -160,6 +175,26 @@ def test_init_accessor_with_schema_errors(sample_df):
              "The following columns in the typing information were missing from the DataFrame: {'is_registered'}")
     with pytest.raises(ValueError, match=error):
         iloc_df.ww.init(schema=schema)
+
+
+def test_accessor_with_schema_parameter_warning(sample_df):
+    xfail_dask_and_koalas(sample_df)
+
+    schema_df = sample_df.copy()
+    schema_df.ww.init(name='test_schema', semantic_tags={'id': 'test_tag'}, index='id')
+    schema = schema_df.ww.schema
+
+    head_df = schema_df.head(2)
+
+    warning = "A schema was provided and the following parameters were ignored: index, make_index, " \
+              "time_index, logical_types, already_sorted, semantic_tags"
+    with pytest.warns(ParametersIgnoredWarning, match=warning):
+        head_df.ww.init(index='ignored_id', time_index="ignored_time_index", logical_types={'ignored': 'ltypes'},
+                        make_index=True, already_sorted=True, semantic_tags={'ignored_id': 'ignored_test_tag'},
+                        schema=schema)
+
+    assert head_df.ww.name == 'test_schema'
+    assert head_df.ww.semantic_tags['id'] == {'index', 'test_tag'}
 
 
 def test_accessor_getattr(sample_df):
@@ -862,7 +897,7 @@ def test_dataframe_methods_on_accessor(sample_df):
     copied_df = schema_df.ww.copy()
 
     assert schema_df is not copied_df
-    assert isinstance(copied_df.ww.schema, Schema)
+    assert schema_df.ww._schema is not copied_df.ww._schema
     assert copied_df.ww.schema == schema_df.ww.schema
 
     pd.testing.assert_frame_equal(to_pandas(schema_df), to_pandas(copied_df))
@@ -875,6 +910,38 @@ def test_dataframe_methods_on_accessor(sample_df):
     assert new_df['id'].dtype == 'string'
     assert new_df.ww.schema is None
     assert schema_df.ww.schema is not None
+
+
+def test_dataframe_methods_on_accessor_new_schema_object(sample_df):
+    xfail_dask_and_koalas(sample_df)
+
+    sample_df.ww.init(index='id', semantic_tags={'email': 'new_tag'},
+                      table_metadata={'contributors': ['user1', 'user2'],
+                                      'created_on': '2/12/20'},
+                      column_metadata={'id': {'important_keys': [1, 2, 3]}})
+
+    copied_df = sample_df.ww.copy()
+
+    assert sample_df.ww.schema == copied_df.ww.schema
+    assert sample_df.ww._schema is not copied_df.ww._schema
+
+    copied_df.ww.metadata['contributors'].append('user3')
+    assert copied_df.ww.metadata == {'contributors': ['user1', 'user2', 'user3'],
+                                     'created_on': '2/12/20'}
+
+    assert sample_df.ww.metadata == {'contributors': ['user1', 'user2'],
+                                     'created_on': '2/12/20'}
+
+    copied_df.ww.reset_semantic_tags(retain_index_tags=False)
+    assert copied_df.ww.index is None
+    assert sample_df.ww.index == 'id'
+
+    assert copied_df.ww.semantic_tags['email'] == set()
+    assert sample_df.ww.semantic_tags['email'] == {'new_tag'}
+
+    copied_df.ww.columns['id']['metadata']['important_keys'].append(4)
+    assert copied_df.ww.columns['id']['metadata'] == {'important_keys': [1, 2, 3, 4]}
+    assert sample_df.ww.columns['id']['metadata'] == {'important_keys': [1, 2, 3]}
 
 
 def test_dataframe_methods_on_accessor_inplace(sample_df):
@@ -890,9 +957,9 @@ def test_dataframe_methods_on_accessor_inplace(sample_df):
 
     pd.testing.assert_frame_equal(to_pandas(schema_df), to_pandas(df_pre_sort.sort_values(['full_name'])))
 
-    warning = "Operation performed by rename has invalidated the Woodwork typing information:\n "\
-        "The following columns in the DataFrame were missing from the typing information: {'new_name'}.\n "\
-        "Please initialize Woodwork with DataFrame.ww.init"
+    warning = "Operation performed by rename has invalidated the Woodwork typing information:\n "
+    "The following columns in the DataFrame were missing from the typing information: {'new_name'}.\n "
+    "Please initialize Woodwork with DataFrame.ww.init"
     with pytest.warns(TypingInfoMismatchWarning, match=warning):
         schema_df.ww.rename({'id': 'new_name'}, inplace=True, axis=1)
     assert 'new_name' in schema_df.columns
@@ -914,9 +981,9 @@ def test_dataframe_methods_on_accessor_returning_series(sample_df):
     assert schema_df.ww.name == 'test_schema'
     pd.testing.assert_series_equal(memory, schema_df.memory_usage())
 
-    warning = "Operation performed by pop has invalidated the Woodwork typing information:\n "\
-        "The following columns in the typing information were missing from the DataFrame: {'id'}.\n "\
-        "Please initialize Woodwork with DataFrame.ww.init"
+    warning = "Operation performed by pop has invalidated the Woodwork typing information:\n "
+    "The following columns in the typing information were missing from the DataFrame: {'id'}.\n "
+    "Please initialize Woodwork with DataFrame.ww.init"
     with pytest.warns(TypingInfoMismatchWarning, match=warning):
         schema_df.ww.pop('id')
     assert 'id' not in schema_df.columns
